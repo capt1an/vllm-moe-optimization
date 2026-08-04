@@ -24,6 +24,24 @@ dag_remaining_cp 定义：
     无论 dag_registry 以何种路径被 import（vllm.dag_registry /
     dag_registry / 相对 import 等），所有调用方共享同一个 _DAGStore
     实例，从根本上避免重复 import 导致的多份 _dags 字典问题。
+
+动态节点扩展（subagent 多轮对话）：
+    Register 时只需注册每个 subagent 的第一轮节点（node_id，例如 "sub_A"）。
+    后续轮次未知 —— harness 在每轮 LLM 调用完成、决定还要继续下一轮时，
+    调用 append_round(dag_id, parent_node_id="sub_A", new_node_id="sub_A__r1",
+    expected_tokens=...) 把下一轮作为新节点插入 DAG。
+
+    拓扑变化：parent → [旧后继] 变为 parent → new_node → [旧后继]，
+    new_node 继承 parent 原有的全部下游依赖，因此任何 join 节点依然会正确地
+    等待所有分支真正走完（无论分支走了几轮）才被触发。
+
+    parent 节点在 append_round 后被标记为 completed（它已被新轮次"消费"，
+    退出 frontier），new_node 成为该分支新的 frontier 节点。
+
+    缓存失效是局部的：cp_remaining(x) 只依赖 x 的后继，因此插入新节点只需
+    清除 parent 及其祖先链（沿 predecessors 反向回溯到根）的 cp_cache 条目，
+    不影响兄弟分支，复杂度 O(DAG 深度) 而非 O(节点总数)。这对高 fan-out、
+    每个 subagent 平均 3-5 轮的场景很重要 —— 避免每轮都触发全图重算。
 """
 from __future__ import annotations
 
@@ -75,6 +93,34 @@ class _DAGEntry:
         )
 
     # ------------------------------------------------------------------
+    # 局部缓存失效：仅清除受影响节点的祖先链，而非整图
+    # ------------------------------------------------------------------
+
+    def _invalidate_ancestors(self, node_id: str) -> None:
+        """
+        清除 node_id 自身及其所有祖先（沿 predecessors 反向 BFS 直到 root）的
+        cp_cache 条目。
+
+        cp_remaining(x) 的递归定义只依赖 x 的后继，因此任何节点 cost 或拓扑变化
+        只会影响"以它为后继的所有祖先"的 cp_remaining 值，与它的兄弟分支或
+        非祖先节点无关 —— 这就是局部失效相比 entry._cp_cache.clear() 的正确性
+        基础：兄弟分支的 cp_cache 条目天然不依赖 node_id，留着不清也不会读到
+        脏值。
+
+        复杂度 O(祖先链长度)，而非 O(全图节点数)。对于 subagent 多轮场景，
+        祖先链长度通常是 DAG 深度，远小于总节点数（尤其是高 fan-out 的 DAG）。
+        """
+        visited: set[str] = set()
+        stack = [node_id]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            self._cp_cache.pop(cur, None)
+            stack.extend(self.predecessors.get(cur, []))
+
+    # ------------------------------------------------------------------
     # dag_remaining_cp：当前剩余子图的关键路径长度
     # ------------------------------------------------------------------
 
@@ -110,6 +156,81 @@ class _DAGEntry:
     def invalidate_dag_remaining_cache(self) -> None:
         """节点完成或 cost 更新后调用，使 dag_remaining 缓存失效。"""
         self._dag_remaining_cache = None
+
+    # ------------------------------------------------------------------
+    # 动态节点追加：subagent 运行时按轮次扩展 DAG
+    # ------------------------------------------------------------------
+
+    def append_round(
+        self,
+        *,
+        parent_node_id: str,
+        new_node_id: str,
+        expected_tokens: int,
+        mark_parent_completed: bool = True,
+    ) -> bool:
+        """
+        在 parent_node_id 和它原有的后继之间插入一个新节点 new_node_id，
+        用于表达"subagent 的下一轮对话"这一运行时才出现的节点。
+
+        拓扑变化：
+            原边  parent → [s1, s2, ...]
+            变为  parent → new_node → [s1, s2, ...]
+
+        即 new_node 继承 parent 原有的全部后继，parent 的后继被替换为仅
+        [new_node]。这保证了 join 节点（多个分支汇合的下游节点）依然能在
+        所有分支各自走完自己的轮次之后才被触发 —— 因为 new_node 的后继
+        集合就是 parent 之前指向的下游集合，传递性保持不变。
+
+        parent_node_id 不存在时返回 False（调用方应当 404）。
+        new_node_id 已存在时返回 False（避免重复 round 误覆盖拓扑），调用方
+        应当视为幂等失败而非异常 —— 常见于客户端重试 PATCH 请求的场景。
+
+        mark_parent_completed:
+            默认 True —— 一旁的 round 完成后，旧 round 节点即被"消费"，从
+            frontier 中退出，新 round 节点成为新的 frontier。
+            设为 False 可用于"预先占位但尚未真正完成"的场景（例如还在
+            decode 中途就想让下一轮的优先级提前生效），此时 parent 仍保留
+            在 frontier 集合判定逻辑之外（因为它已有后继，不会再是 frontier）。
+        """
+        if parent_node_id not in self.nodes:
+            return False
+        if new_node_id in self.nodes:
+            return False  # idempotent no-op; caller treats as failure to retry-safe
+
+        old_children = self.successors.get(parent_node_id, [])
+
+        # 1. 注册新节点
+        self.nodes[new_node_id] = max(1, expected_tokens)
+        self.successors[new_node_id] = old_children
+        self.predecessors[new_node_id] = [parent_node_id]
+
+        # 2. 重连：parent 的后继替换为 [new_node_id]
+        self.successors[parent_node_id] = [new_node_id]
+
+        # 3. 旧后继的 predecessors 指向从 parent 改为 new_node_id
+        for child in old_children:
+            preds = self.predecessors.setdefault(child, [])
+            if parent_node_id in preds:
+                preds[preds.index(parent_node_id)] = new_node_id
+            elif new_node_id not in preds:
+                preds.append(new_node_id)
+
+        # 4. 局部失效：new_node 插入会改变 parent 及其所有祖先的 cp_remaining
+        #    （因为 parent 的 downstream 现在多了一层）。new_node 本身和
+        #    old_children 的 cp_remaining 值不变（cp_remaining 只依赖后继，
+        #    new_node 的后继集合 == parent 原来的后继集合，值相同，可保留）。
+        self._invalidate_ancestors(parent_node_id)
+
+        if mark_parent_completed:
+            self.completed_nodes.add(parent_node_id)
+        self.invalidate_dag_remaining_cache()
+
+        logger.debug(
+            "append_round: parent=%s new_node=%s tokens=%d old_children=%s",
+            parent_node_id, new_node_id, expected_tokens, old_children,
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +280,36 @@ class _DAGStore:
             if entry is None or node_id not in entry.nodes:
                 return False
             entry.nodes[node_id] = max(1, new_cost)
-            entry._cp_cache.clear()
+            # 局部失效：cost 变化只影响 node_id 自身及其祖先的 cp_remaining，
+            # 不影响兄弟分支或下游节点 —— 全图 clear() 在节点数较多、
+            # 高频 Layer-2 重估场景下是不必要的开销。
+            entry._invalidate_ancestors(node_id)
             entry.invalidate_dag_remaining_cache()
             return True
+
+    def append_round(
+        self,
+        dag_id: str,
+        parent_node_id: str,
+        new_node_id: str,
+        expected_tokens: int,
+    ) -> bool:
+        """
+        在已完成（或即将完成）的 parent_node_id 之后追加一个运行时才出现的
+        新节点 new_node_id，代表 subagent 的下一轮对话。
+
+        Returns False if dag_id unknown, parent_node_id unknown, or
+        new_node_id already exists (idempotent-safe for retried PATCHes).
+        """
+        with self._lock:
+            entry = self._dags.get(dag_id)
+            if entry is None:
+                return False
+            return entry.append_round(
+                parent_node_id=parent_node_id,
+                new_node_id=new_node_id,
+                expected_tokens=expected_tokens,
+            )
 
     def compute_priority(
         self, dag_id: str, node_id: str
@@ -245,10 +393,38 @@ def update_node_cost(dag_id: str, node_id: str, new_cost: int) -> bool:
     """
     Update a node's expected token cost with an online LLM estimate.
 
-    Clears the cp_remaining cache so subsequent compute_priority() calls
-    use the new cost. Thread-safe; returns False if dag_id/node_id unknown.
+    Clears only the affected node's ancestor chain from the cp_remaining
+    cache (not the whole DAG) so subsequent compute_priority() calls use the
+    new cost. Thread-safe; returns False if dag_id/node_id unknown.
     """
     return _get_store().update_node_cost(dag_id, node_id, new_cost)
+
+
+def append_round(
+    dag_id: str,
+    parent_node_id: str,
+    new_node_id: str,
+    expected_tokens: int,
+) -> bool:
+    """
+    Append a runtime-discovered round node after parent_node_id.
+
+    Use this when a subagent's number of LLM rounds is not known upfront:
+    register only the first round at DAG-registration time, then call this
+    once per subsequent round as the conversation actually progresses.
+
+    The new node is spliced in between parent_node_id and parent's existing
+    successors, so any downstream join node still waits correctly. parent_node_id
+    is marked completed (it has been "consumed" by the new round), and the
+    new node becomes the new frontier node for this branch.
+
+    Returns False if dag_id or parent_node_id is unknown, or if new_node_id
+    is already registered (idempotent-safe — a retried PATCH from the client
+    won't corrupt the topology a second time).
+    """
+    return _get_store().append_round(
+        dag_id, parent_node_id, new_node_id, expected_tokens
+    )
 
 
 def compute_priority(dag_id: str, node_id: str) -> tuple[int, int] | None:

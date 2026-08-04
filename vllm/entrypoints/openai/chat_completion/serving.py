@@ -1277,12 +1277,15 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
-        # Send the final done message after all response.n are finished
-        yield "data: [DONE]\n\n"
-        
-        if request.dag_id and request.node_id:
-            mark_completed(request.dag_id, request.node_id)
-            # print(f"STream: complete mark:", request.dag_id, request.node_id)
+        # Send the final done message after all response.n are finished.
+        # Wrap yield+DONE in try/finally so mark_completed always runs —
+        # even if the streaming generator is cleaned up via GeneratorExit
+        # (e.g. client timeout / disconnect) while paused at this yield.
+        try:
+            yield "data: [DONE]\n\n"
+        finally:
+            if request.dag_id and request.node_id:
+                mark_completed(request.dag_id, request.node_id)
 
     async def chat_completion_full_generator(
         self,
