@@ -1,4 +1,31 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# vLLM MoE Optimization
+
+> [!IMPORTANT]
+> This repository is an experimental research fork of
+> [vllm-project/vllm](https://github.com/vllm-project/vllm), based on a vLLM
+> 0.19.1 development snapshot. It is not an official vLLM release and is not
+> maintained or endorsed by the vLLM project.
+
+This fork focuses on distributed LLM serving and Mixture-of-Experts (MoE)
+performance research. Its main additions include:
+
+- Experimental dual-batch overlap (DBO) with the
+  `allgather_reducescatter` MoE backend.
+- Asynchronous AgRs dispatch/combine and communication-computation overlap.
+- Correct per-rank data-parallel metadata handling across microbatches.
+- MoE stage timing, routing-load statistics, and performance benchmarks.
+- Qwen2-MoE expert metadata support for expert parallel load balancing.
+
+The upstream vLLM documentation below is retained for reference. 
+
+- **Upstream:** [vllm-project/vllm](https://github.com/vllm-project/vllm)
+- **Base revision:** [`b1388b1fb`](https://github.com/vllm-project/vllm/commit/b1388b1fbf5aaef47937fabe98931211684666a6)
+- **License:** [Apache License 2.0](LICENSE), the same license used upstream
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
