@@ -64,6 +64,7 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
+        # print("应该是这里的prepare！！")
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             # TODO: this only works for topK=1, will need to update for topK>1

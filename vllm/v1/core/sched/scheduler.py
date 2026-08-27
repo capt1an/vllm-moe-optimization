@@ -602,6 +602,7 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                # KV
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
@@ -609,6 +610,7 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    # 这里是不是去找已经计算过的kv，也就是本地现存中的kv cache block。这里取的最大命中cache长度为请求token数-1
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
@@ -743,6 +745,7 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                # 如果是阻塞（非异步）的kvload，在这里allocate slots
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,

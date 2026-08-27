@@ -26,6 +26,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm.v1.worker.ubatch_utils import split_num_tokens_across_dp
 
 logger = init_logger(__name__)
 
@@ -279,13 +280,18 @@ class UBatchWrapper:
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
         def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
+            ubatch_id = ubatch_metadata.context.id
+            # Keep one long-lived profiler range around each microbatch. CUDA
+            # launches inside this range retain their CPU correlation flow, so
+            # Perfetto can attribute compute/communication to ubatch 0 or 1.
+            with torch.profiler.record_function(f"dbo.ubatch_{ubatch_id}"):
+                with ubatch_metadata.context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
             results.append((ubatch_metadata.context.id, model_output))
 
         results: list[tuple[int, torch.Tensor]] = []
@@ -293,19 +299,28 @@ class UBatchWrapper:
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
         # after both threads have finished
-        with override_forward_context(None):
+        # PyTorch profiler CPU scopes are thread-local. This main-thread range
+        # remains visible in a Perfetto trace while the temporary ubatch
+        # threads enqueue their CUDA work beneath it.
+        with (
+            torch.profiler.record_function("dbo.run_ubatches"),
+            override_forward_context(None),
+        ):
             ubatch_threads = []
-            for metadata in ubatch_metadata:
-                thread = threading.Thread(
-                    target=_ubatch_thread,
-                    args=(
-                        results,
-                        model,
-                        metadata,
-                    ),
-                )
-                ubatch_threads.append(thread)
-                thread.start()
+            for ubatch_id, metadata in enumerate(ubatch_metadata):
+                with torch.profiler.record_function(
+                    f"dbo.launch_ubatch_{ubatch_id}"
+                ):
+                    thread = threading.Thread(
+                        target=_ubatch_thread,
+                        args=(
+                            results,
+                            model,
+                            metadata,
+                        ),
+                    )
+                    ubatch_threads.append(thread)
+                    thread.start()
             self.ready_barrier.wait()  # Wait for both threads to be ready
             ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
@@ -450,17 +465,45 @@ class UBatchWrapper:
 
         # We shouldn't be here unless we are running with multiple DP ranks
         assert dp_metadata is not None
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        assert dp_metadata.num_tokens_across_dp_cpu.numel() == dp_size, (
+            "DP metadata must contain one token count per rank: "
+            f"expected={dp_size}, "
+            f"actual={dp_metadata.num_tokens_across_dp_cpu.numel()}"
+        )
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        parent_local_tokens = int(
+            dp_metadata.num_tokens_across_dp_cpu[dp_rank].item()
+        )
+        assert num_tokens == parent_local_tokens, (
+            "Parent DP metadata must describe the complete microbatched input: "
+            f"dp_rank={dp_rank}, slice_total={num_tokens}, "
+            f"metadata_tokens={parent_local_tokens}"
+        )
+        num_ubatches = len(ubatch_slices)
+        ubatch_num_tokens_across_dp = split_num_tokens_across_dp(
+            dp_metadata.num_tokens_across_dp_cpu,
+            num_ubatches,
+        )
+        assert len(ubatch_num_tokens_across_dp) == num_ubatches
+
         ubatch_dp_metadata = []
-        for ubatch_slice in ubatch_slices:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            ubatch_num_tokens_across_dp = torch.tensor(
-                [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
+        for ubatch_id, (ubatch_slice, tokens_across_dp) in enumerate(
+            zip(ubatch_slices, ubatch_num_tokens_across_dp, strict=True)
+        ):
+            expected_local_tokens = int(tokens_across_dp[dp_rank].item())
+            assert ubatch_slice.num_tokens == expected_local_tokens, (
+                "Local microbatch slice does not match the DP-coordinated "
+                f"token count: ubatch_id={ubatch_id}, dp_rank={dp_rank}, "
+                f"slice_tokens={ubatch_slice.num_tokens}, "
+                f"expected_tokens={expected_local_tokens}, "
+                f"tokens_across_dp={tokens_across_dp.tolist()}"
             )
             ubatch_dp_metadata.append(
                 DPMetadata.make(
                     self.vllm_config.parallel_config,
                     ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
+                    tokens_across_dp,
                 )
             )
 

@@ -15,6 +15,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     slice_query_start_locs,
     split_attn_metadata,
+    split_num_tokens_across_dp,
 )
 
 
@@ -76,6 +77,28 @@ def test_slice_bounds_edge_cases(sample_query_start_loc):
 
     expected = torch.tensor([0, 15])
     assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "totals,num_ubatches,expected",
+    [
+        ([10, 12], 2, [[5, 6], [5, 6]]),
+        ([11, 14], 2, [[5, 7], [6, 7]]),
+        ([10, 11], 3, [[3, 3], [3, 3], [4, 5]]),
+    ],
+)
+def test_split_num_tokens_across_dp(totals, num_ubatches, expected):
+    totals_tensor = torch.tensor(totals, dtype=torch.int32)
+
+    result = split_num_tokens_across_dp(totals_tensor, num_ubatches)
+
+    assert [sizes.tolist() for sizes in result] == expected
+    torch.testing.assert_close(torch.stack(result).sum(dim=0), totals_tensor)
+
+
+def test_split_num_tokens_across_dp_rejects_empty_microbatch():
+    with pytest.raises(AssertionError, match="at least one token"):
+        split_num_tokens_across_dp(torch.tensor([1, 8]), num_ubatches=2)
 
 
 @pytest.fixture
@@ -339,6 +362,15 @@ def test_prefill_split_across_ubatches(
     # Number of requests per ubatch
     assert first_meta.num_reqs == expected_first_reqs
     assert second_meta.num_reqs == expected_second_reqs
+
+    # Token-balanced microbatches need not contain the same number of
+    # requests. Every request-indexed attention tensor must follow the local
+    # microbatch size rather than the unsplit batch or the other microbatch.
+    for metadata in (first_meta, second_meta):
+        assert metadata.query_start_loc.shape[0] == metadata.num_reqs + 1
+        assert metadata.seq_lens.shape[0] == metadata.num_reqs
+        assert metadata.block_table_tensor.shape[0] == metadata.num_reqs
+        assert metadata.slot_mapping.shape[0] == metadata.num_actual_tokens
 
     # Identify which request is split and how many tokens are in the first chunk
     split_req_idx = int(np.searchsorted(qsl_np, split_point, side="right") - 1)

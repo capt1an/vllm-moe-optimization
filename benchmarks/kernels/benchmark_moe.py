@@ -303,15 +303,22 @@ def benchmark_config(
             )
 
     # JIT compilation & warmup
-    run()
-    torch.accelerator.synchronize()
+    try:
+        run()
+        torch.accelerator.synchronize()
 
-    # Capture 10 invocations with CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(10):
-            run()
-    torch.accelerator.synchronize()
+        # Capture 10 invocations with CUDA graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(10):
+                run()
+        torch.accelerator.synchronize()
+    except Exception as e:
+        # Some config combinations trigger Triton compiler bugs (e.g. the
+        # MLIR dominance failure with large BLOCK_SIZE_M on sm86). Skip
+        # them instead of aborting the whole sweep.
+        print(f"Skipping config due to compile failure: {config}, {e}")
+        return float("inf")
 
     # Warmup
     for _ in range(5):

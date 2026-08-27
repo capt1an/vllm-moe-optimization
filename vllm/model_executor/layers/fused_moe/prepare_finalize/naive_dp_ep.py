@@ -1,16 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
+from collections.abc import Callable
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.moe_timing import stage
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_enabled,
+    dbo_yield_and_switch_from_comm_to_compute,
+    dbo_yield_and_switch_from_compute_to_comm,
+)
+
+
+_ASYNC_COMBINE_STREAMS: dict[int, torch.cuda.Stream] = {}
+_ASYNC_COMBINE_STREAMS_LOCK = threading.Lock()
+
+
+def _get_async_combine_stream() -> torch.cuda.Stream:
+    device_index = torch.cuda.current_device()
+    stream = _ASYNC_COMBINE_STREAMS.get(device_index)
+    if stream is None:
+        with _ASYNC_COMBINE_STREAMS_LOCK:
+            stream = _ASYNC_COMBINE_STREAMS.get(device_index)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device_index)
+                _ASYNC_COMBINE_STREAMS[device_index] = stream
+    return stream
 
 
 def _quantize_and_setup_dispatch(
@@ -97,6 +124,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     def num_dispatchers(self) -> int:
         return self._num_dispatchers
 
+    def supports_async(self) -> bool:
+        return dbo_enabled() or envs.VLLM_MOE_NAIVE_AGRS_ASYNC
+
     def output_is_reduced(self) -> bool:
         return False
 
@@ -160,9 +190,158 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        with stage("mk", "combine_comm"):
+            combined = get_ep_group().combine(
+                out, is_sequence_parallel=self.is_sequence_parallel
+            )
+        output.copy_(combined)
+
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> mk.ReceiverType:
+        """Dispatch through either the regular or DBO schedule.
+
+        Without DBO, dispatch stays inline: the dispatched tokens are consumed
+        immediately, and an extra stream handoff was measured to regress small
+        decode batches. With DBO, yield after input preparation so the other
+        ubatch can enqueue compute, then launch AgRs dispatch on the DBO comm
+        stream. Switching back synchronizes the current ubatch's compute stream
+        with that communication while allowing the other ubatch's queued work
+        to overlap it.
+        """
+        if not dbo_enabled():
+            result = self.prepare(
+                a1,
+                topk_weights,
+                topk_ids,
+                num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+                quant_config,
+                defer_input_quant,
+            )
+
+            def receiver() -> mk.PrepareResultType:
+                return result
+
+            return receiver
+
+        if apply_router_weight_on_input:
+            topk = topk_ids.size(1)
+            assert topk == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
+            a1 = a1 * topk_weights.to(a1.dtype)
+
+        a1q, scales = _quantize_and_setup_dispatch(
+            a1, quant_config, defer_input_quant
         )
+        dbo_yield_and_switch_from_compute_to_comm()
+        ubatch_id = dbo_current_ubatch_id()
+        with torch.profiler.record_function(
+            f"dbo.ubatch_{ubatch_id}.dispatch_comm"
+        ):
+            res = get_ep_group().dispatch(
+                a1q,
+                topk_weights,
+                topk_ids,
+                is_sequence_parallel=self.is_sequence_parallel,
+                extra_tensors=scales,
+            )
+        # The collective has been enqueued on the shared communication
+        # stream. Yield once more so the other ubatch can enqueue its
+        # dispatch before this ubatch starts routed-expert compute. When this
+        # ubatch resumes, its compute stream waits only for its own dispatch
+        # event, allowing routed compute to overlap the next dispatch.
+        dbo_yield_and_switch_from_comm_to_compute()
+
+        if scales is None:
+            a1q, topk_weights, topk_ids = res
+            a1q_scale = None
+        else:
+            a1q, topk_weights, topk_ids, scales = res
+            a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
+
+        result = a1q, a1q_scale, None, topk_ids, topk_weights
+
+        def receiver() -> mk.PrepareResultType:
+            return result
+
+        return receiver
+
+    def finalize_async(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> Callable:
+        """Run combine through the DBO or standalone async schedule."""
+        if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+            weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+
+        out = weight_and_reduce_impl.apply(
+            output=None,
+            fused_expert_output=fused_expert_output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+        if dbo_enabled():
+            dbo_yield_and_switch_from_compute_to_comm()
+            ubatch_id = dbo_current_ubatch_id()
+            with torch.profiler.record_function(
+                f"dbo.ubatch_{ubatch_id}.combine_comm"
+            ):
+                with stage("mk", "combine_comm"):
+                    combined = get_ep_group().combine(
+                        out, is_sequence_parallel=self.is_sequence_parallel
+                    )
+            # Let the other ubatch enqueue its reduce-scatter before this
+            # ubatch resumes post-MoE compute. The per-ubatch comm-done event
+            # preserves the dependency on ``combined`` without globally
+            # serializing the compute and communication streams.
+            dbo_yield_and_switch_from_comm_to_compute()
+
+            def receiver() -> None:
+                output.copy_(combined)
+
+            return receiver
+
+        assert envs.VLLM_MOE_NAIVE_AGRS_ASYNC
+        compute_stream = torch.cuda.current_stream()
+        comm_stream = _get_async_combine_stream()
+        comm_stream.wait_stream(compute_stream)
+        out.record_stream(comm_stream)
+        combine_done = torch.cuda.Event()
+        with torch.cuda.stream(comm_stream):
+            with (
+                torch.profiler.record_function("agrs_async.combine_comm"),
+                stage("mk", "combine_comm"),
+            ):
+                combined = get_ep_group().combine(
+                    out, is_sequence_parallel=self.is_sequence_parallel
+                )
+            combine_done.record(comm_stream)
+
+        def receiver() -> None:
+            current_compute_stream = torch.cuda.current_stream()
+            current_compute_stream.wait_event(combine_done)
+            combined.record_stream(current_compute_stream)
+            output.copy_(combined)
+
+        return receiver
 
 
 class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):

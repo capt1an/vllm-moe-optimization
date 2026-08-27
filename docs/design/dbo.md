@@ -34,10 +34,19 @@ To enable the DBO system pass in the `--enable-dbo` argument to your vllm serve 
 * `--dbo-decode-token-threshold` the minimum number of tokens in a decode-only batch required to enable DBO for that batch
 * `--dbo-prefill-token-threshold` the minimum number of tokens in a batch containing at least one prefill required to enable DBO for that batch
 
-Currently, DBO is only supported with DeepEP, so DeepEP must be installed and the `--all2all-backend` argument must be set to `deepep_low_latency` if your workload is primarily decode requests, or `deepep_high_throughput` if your workload is primarily prefill requests.
+DBO supports the DeepEP low-latency and high-throughput backends. The
+`allgather_reducescatter` backend also has an experimental DBO schedule for
+CUDA devices: its NCCL all-gather/reduce-scatter collectives run on the DBO
+communication stream while the other microbatch enqueues compute. The DeepEP
+backends remain the established production paths; validate correctness and
+performance carefully before using the AgRs path in production.
 
 Below is a command that will spin up a two DP rank server with expert parallelism and DBO enabled.
 EX: `vllm serve deepseek-ai/DeepSeek-V2-Lite --trust-remote-code --data-parallel-size 2 --enable-expert-parallel --enable-dbo --all2all-backend deepep_low_latency`
+
+On CUDA GPUs that are not supported by DeepEP, including Ampere, use the
+experimental NCCL AgRs path instead:
+`vllm serve deepseek-ai/DeepSeek-V2-Lite --trust-remote-code --data-parallel-size 2 --enable-expert-parallel --enable-dbo --all2all-backend allgather_reducescatter`
 
 Note that there must be at least two GPUs visible in `CUDA_VISIBLE_DEVICES`
 

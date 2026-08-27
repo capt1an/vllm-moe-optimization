@@ -29,6 +29,40 @@ class UBatchSlice:
 UBatchSlices: TypeAlias = list[UBatchSlice]
 
 
+def split_num_tokens_across_dp(
+    num_tokens_across_dp: torch.Tensor,
+    num_ubatches: int,
+) -> list[torch.Tensor]:
+    """Split every DP rank's padded token count into microbatch sizes.
+
+    This mirrors :func:`maybe_create_ubatch_slices`: the first
+    ``num_ubatches - 1`` microbatches receive ``total // num_ubatches``
+    tokens and the final microbatch receives the remainder. Deriving the
+    cross-rank vectors from the coordinated parent metadata avoids assuming
+    that every rank has the local rank's microbatch size.
+    """
+    assert num_ubatches > 1
+    assert num_tokens_across_dp.ndim == 1
+    assert num_tokens_across_dp.device.type == "cpu"
+    assert torch.all(num_tokens_across_dp >= num_ubatches), (
+        "Every DP rank must have at least one token in every microbatch: "
+        f"num_tokens_across_dp={num_tokens_across_dp.tolist()}, "
+        f"num_ubatches={num_ubatches}"
+    )
+
+    tokens_per_regular_ubatch = num_tokens_across_dp // num_ubatches
+    result = [
+        tokens_per_regular_ubatch.clone() for _ in range(num_ubatches - 1)
+    ]
+    result.append(
+        num_tokens_across_dp
+        - tokens_per_regular_ubatch * (num_ubatches - 1)
+    )
+
+    assert torch.equal(torch.stack(result).sum(dim=0), num_tokens_across_dp)
+    return result
+
+
 def is_last_ubatch_empty(
     orig_num_tokens: int, padded_num_tokens: int, num_ubatches: int
 ) -> bool:
@@ -210,6 +244,15 @@ def _make_metadata_with_slice(
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
+
+    # Attention kernels derive their batch size from query_start_loc. Keep all
+    # request-indexed tensors aligned with it. This catches invalid microbatch
+    # metadata before it reaches a backend kernel (where the resulting shape
+    # error is much harder to diagnose).
+    assert query_start_loc.shape[0] == num_requests + 1
+    assert seq_lens.shape[0] == num_requests
+    assert block_table_tensor.shape[0] == num_requests
+    assert slot_mapping.shape[0] == num_actual_tokens
 
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,

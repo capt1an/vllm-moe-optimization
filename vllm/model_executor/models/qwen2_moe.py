@@ -32,15 +32,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.moe_timing import stage
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -58,9 +62,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
@@ -119,12 +124,30 @@ class Qwen2MoeMLP(nn.Module):
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
-        config: Qwen2MoeConfig,
-        quant_config: QuantizationConfig | None = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
     ):
         super().__init__()
+        config = vllm_config.model_config.hf_config
+        parallel_config = vllm_config.parallel_config
+        quant_config = vllm_config.quant_config
+        self.layer_name = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
+
+        self.ep_group = get_ep_group().device_group
+        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+
+        self.enable_eplb = parallel_config.enable_eplb
+        self.n_routed_experts = config.num_experts
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = (
+            parallel_config.eplb_config.num_redundant_experts
+        )
+        self.n_physical_experts = (
+            self.n_logical_experts + self.n_redundant_experts
+        )
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -163,7 +186,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.experts = SharedFusedMoE(
             shared_experts=self.shared_expert,
-            num_experts=config.num_experts,
+            num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -171,6 +194,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -180,7 +205,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        with stage(self.layer_name, "gate"):
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -286,12 +312,13 @@ class Qwen2MoeAttention(nn.Module):
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen2MoeConfig,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
         self.hidden_size = config.hidden_size
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
@@ -319,7 +346,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen2MoeSparseMoeBlock(
-                config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -363,8 +390,10 @@ class Qwen2MoeModel(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        self.num_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
 
         self.vocab_size = config.vocab_size
         self.config = config
@@ -378,9 +407,7 @@ class Qwen2MoeModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Qwen2MoeDecoderLayer(
-                config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
+                vllm_config=vllm_config,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
@@ -428,6 +455,7 @@ class Qwen2MoeModel(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
+            num_redundant_experts=self.num_redundant_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -535,7 +563,7 @@ class Qwen2MoeModel(nn.Module):
         return loaded_params
 
 
-class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
     fall_back_to_pt_during_load = False
     packed_modules_mapping = {
         "qkv_proj": [
@@ -573,6 +601,51 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+        self.expert_weights = []
+        self.moe_layers = []
+        example_moe = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            assert isinstance(layer, Qwen2MoeDecoderLayer)
+            if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+                example_moe = layer.mlp
+                self.moe_layers.append(layer.mlp.experts)
+
+        if example_moe is None:
+            raise RuntimeError("No Qwen2MoE layer found in model.layers.")
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = 1
+        self.num_shared_experts = 0
+        self.num_logical_experts = example_moe.n_logical_experts
+        self.num_physical_experts = example_moe.n_physical_experts
+        self.num_local_physical_experts = example_moe.n_local_physical_experts
+        self.num_routed_experts = example_moe.n_routed_experts
+        self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = (
+            num_physical_experts - self.num_logical_experts
+        )
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            assert isinstance(layer, Qwen2MoeDecoderLayer)
+            if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+                moe = layer.mlp
+                moe.n_local_physical_experts = num_local_physical_experts
+                moe.n_physical_experts = num_physical_experts
+                moe.n_redundant_experts = self.num_redundant_experts
+                moe.experts.update_expert_map()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

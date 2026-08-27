@@ -145,6 +145,10 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Local research notes
+/KV_CACHE_NOTES.md
+/MOE_OPT_NOTES.md
 env/
 venv/
 ENV/

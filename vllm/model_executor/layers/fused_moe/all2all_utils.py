@@ -69,16 +69,32 @@ def maybe_roundup_layer_hidden_size(
         Original hidden size otherwise.
     """
     if moe_parallel_config.use_deepep_ht_kernels:
+        if not has_deep_ep():
+            raise ValueError(
+                "all2all backend 'deepep_high_throughput' was requested but "
+                "the `deep_ep` package is not installed."
+            )
         hidden_size = DeepEPHTPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype
         )
 
     if moe_parallel_config.use_deepep_ll_kernels:
+        if not has_deep_ep():
+            raise ValueError(
+                "all2all backend 'deepep_low_latency' was requested but "
+                "the `deep_ep` package is not installed."
+            )
         hidden_size = DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
 
     if moe_parallel_config.use_nixl_ep_kernels:
+        if not has_nixl_ep():
+            raise ValueError(
+                "all2all backend 'nixl_ep' was requested but the `nixl_ep` "
+                "package is not installed. Install it with: "
+                "uv pip install 'nixl-cu12>=0.7.1,<0.10.0'"
+            )
         hidden_size = NixlEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
@@ -229,7 +245,7 @@ def maybe_make_prepare_finalize(
             num_dispatchers=all2all_manager.world_size,
         )
 
-    elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
+    elif moe.use_ag_rs_all2all_kernels:
         prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
             use_monolithic=use_monolithic,
             is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,

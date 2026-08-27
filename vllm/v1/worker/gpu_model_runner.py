@@ -2218,8 +2218,19 @@ class GPUModelRunner(
         # same metadata builder and KVCacheSpec is the same is the block table, so we
         # can cache the attention metadata builds and just update the block table using
         # `builder.update_block_table` if the builder supports it.
+        # Metadata can be reused between KV-cache groups only within the same
+        # microbatch. Different microbatches may contain different numbers of
+        # requests (in particular when a prefill is split by token count), so
+        # reusing one microbatch's metadata and updating only its block table
+        # leaves query_start_loc/seq_lens inconsistent with the new block
+        # table.
         cached_attn_metadata: dict[
-            tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
+            tuple[
+                KVCacheSpec,
+                type[AttentionMetadataBuilder],
+                int | None,
+            ],
+            AttentionMetadata,
         ] = {}
 
         def _build_attn_group_metadata(
@@ -2233,7 +2244,7 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            cache_key = (kv_cache_spec, type(builder))
+            cache_key = (kv_cache_spec, type(builder), ubid)
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -5450,14 +5461,6 @@ class GPUModelRunner(
                     num_tokens_padded, None, False
                 )
 
-            if ubatch_slices_padded is not None:
-                # Adjust values to reflect a single ubatch.
-                # TODO(sage,lucas): this is cruft that should be addressed in
-                #  the padding refactor.
-                num_tokens_padded = ubatch_slices_padded[0].num_tokens
-                if num_tokens_across_dp is not None:
-                    num_tokens_across_dp[:] = num_tokens_padded
-
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -5778,9 +5781,21 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # Profile the largest non-microbatched batch. DBO can be aborted at
+        # runtime when the DP ranks have sufficiently imbalanced token counts
+        # (for example, to avoid an empty final microbatch). In that case one
+        # model invocation must process up to ``max_num_tokens`` even though a
+        # normal DBO profile would only exercise one microbatch at a time.
+        # Workspace buffers are locked after profiling, so failing to cover
+        # this fallback makes a later, valid batch attempt to grow a locked
+        # workspace.
+        #
+        # This run also pre-allocates the communication buffers via
+        # ``is_profile``.
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            allow_microbatching=False,
+            is_profile=True,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:

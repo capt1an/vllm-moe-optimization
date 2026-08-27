@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_MOE_NAIVE_AGRS_ASYNC: bool = False
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -1581,6 +1582,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    # Overlap naive AgRs combine communication with shared-expert compute.
+    # DBO owns a separate communication-stream scheduler and takes precedence.
+    "VLLM_MOE_NAIVE_AGRS_ASYNC": lambda: bool(
+        int(os.getenv("VLLM_MOE_NAIVE_AGRS_ASYNC", "0"))
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))

@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.moe_timing import stage
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     disable_inplace,
@@ -37,6 +38,7 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1005,6 +1007,7 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
+        # print("self.prepare_finalize的类型", type(self.prepare_finalize)) # no dp ep
 
     def _allocate_buffers(
         self,
@@ -1262,7 +1265,8 @@ class FusedMoEKernelModularImpl:
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
             if self.shared_experts is not None:
-                shared_output = self.shared_experts(se_hidden_states)
+                with stage("mk", "shared"):
+                    shared_output = self.shared_experts(se_hidden_states)
         else:
             finalize_ret = self.prepare_finalize.finalize_async(
                 output,
@@ -1273,7 +1277,11 @@ class FusedMoEKernelModularImpl:
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
             if self.shared_experts is not None:
-                shared_output = self.shared_experts(se_hidden_states)
+                with (
+                    torch.profiler.record_function("agrs_async.shared"),
+                    stage("mk", "shared"),
+                ):
+                    shared_output = self.shared_experts(se_hidden_states)
 
             # TODO(lucas): refactor this in the alternative schedules followup
             # currently unpack if we have hook + receiver pair or just
@@ -1353,40 +1361,45 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-        )
+        with stage("mk", "pf_dispatch"):
+            a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = (
+                self._prepare(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                )
+            )
 
-        fused_out = self._fused_experts(
-            in_dtype=hidden_states.dtype,
-            a1q=a1q,
-            a1q_scale=a1q_scale,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_tokens_meta=expert_tokens_meta,
-        )
+        with stage("mk", "routed"):
+            fused_out = self._fused_experts(
+                in_dtype=hidden_states.dtype,
+                a1q=a1q,
+                a1q_scale=a1q_scale,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_tokens_meta=expert_tokens_meta,
+            )
 
-        return self._finalize(
-            output,
-            fused_out,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
-            shared_experts_input=shared_experts_input,
-        )
+        with stage("mk", "pf_combine"):
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+                shared_experts_input=shared_experts_input,
+            )
 
 
 @final

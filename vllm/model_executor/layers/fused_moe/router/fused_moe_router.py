@@ -13,6 +13,11 @@ class FusedMoERouter(ABC):
     method that is used for routing hidden states based on router logits.
     """
 
+    def __init__(self) -> None:
+        self.timing_layer_name = "unknown_moe_layer"
+        self.timing_num_ranks = 1
+        self.timing_round_robin = False
+
     @property
     @abstractmethod
     def routing_method_type(self) -> RoutingMethodType:

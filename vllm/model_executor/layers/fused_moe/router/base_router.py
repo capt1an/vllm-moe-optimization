@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.model_executor.layers.fused_moe.moe_timing import record_routes
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -241,7 +242,24 @@ class BaseRouter(FusedMoERouter):
             self.capture_fn(topk_ids)
 
         # Step 4: Apply EPLB mapping
+        logical_topk_ids = topk_ids
         topk_ids = self._apply_eplb_mapping(topk_ids)
+
+        num_logical_experts = (
+            self.eplb_state.logical_replica_count.numel()
+            if self.enable_eplb
+            and self.eplb_state.logical_replica_count is not None
+            else self.global_num_experts
+        )
+        record_routes(
+            layer_name=self.timing_layer_name,
+            logical_ids=logical_topk_ids,
+            physical_ids=topk_ids,
+            num_logical_experts=num_logical_experts,
+            num_physical_experts=self.global_num_experts,
+            num_ranks=self.timing_num_ranks,
+            round_robin=self.timing_round_robin,
+        )
 
         # Step 5: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)

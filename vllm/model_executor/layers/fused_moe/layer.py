@@ -445,6 +445,7 @@ class FusedMoE(CustomOp):
 
         # TODO(bnell): we should not have to create a router if the kernel is
         # monolithic.
+        # FusedTopKRouter（softmax+topk 的实现）
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=self.global_num_experts,
@@ -462,6 +463,13 @@ class FusedMoE(CustomOp):
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
+        )
+        # Debug-only routing statistics use these labels to report per-layer
+        # logical/physical expert histograms and physical-slot load per rank.
+        self.router.timing_layer_name = prefix
+        self.router.timing_num_ranks = self.ep_size
+        self.router.timing_round_robin = (
+            self.expert_placement_strategy == "round_robin"
         )
         self.routing_method_type: RoutingMethodType = self.router.routing_method_type
 
@@ -499,6 +507,7 @@ class FusedMoE(CustomOp):
 
         self.quant_config = quant_config
 
+        # 无量化配置 → UnquantizedFusedMoEMethod。注意它本身也是一个 CustomOp
         def _get_quant_method() -> FusedMoEMethodBase:
             """
             Helper method to ensure self.quant_method is never None and

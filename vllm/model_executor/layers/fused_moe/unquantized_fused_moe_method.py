@@ -224,6 +224,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
 
+        # 权重加载完成后创建 MK（process_weights_after_loading → _setup_kernel）
         self.kernel = make_unquantized_moe_kernel(
             backend=self.unquantized_backend,
             quant_config=self.moe_quant_config,

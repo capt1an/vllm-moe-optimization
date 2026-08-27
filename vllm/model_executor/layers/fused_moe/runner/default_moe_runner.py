@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.moe_timing import flush, stage
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -246,6 +247,7 @@ class DefaultMoERunner(MoERunner):
 
         self.moe_forward = self._select_forward(layer)
 
+    # 选择前向的入口
     def _select_forward(self, layer: torch.nn.Module) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
@@ -256,7 +258,7 @@ class DefaultMoERunner(MoERunner):
         return (
             torch.ops.vllm.moe_forward
             if self.shared_experts is None
-            else torch.ops.vllm.moe_forward_shared
+            else torch.ops.vllm.moe_forward_shared  # ← Qwen1.5-MoE 走这个
         )
 
     @property
@@ -486,7 +488,8 @@ class DefaultMoERunner(MoERunner):
 
         # Run this before quant_method to avoid inplace issues.
         if run_shared_experts_before:
-            shared_output = self._apply_shared_experts(shared_input, False)
+            with stage(self.layer_name, "shared"):
+                shared_output = self._apply_shared_experts(shared_input, False)
 
         if self.quant_method.is_monolithic:
             result = self.quant_method.apply_monolithic(
@@ -495,18 +498,33 @@ class DefaultMoERunner(MoERunner):
                 router_logits=router_logits,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
+            with stage(self.layer_name, "routing"):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
 
-            result = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_input,
-            )
+            if self.quant_method.supports_internal_mk or (
+                getattr(self.quant_method, "kernel", None) is not None
+            ):
+                # The modular-kernel path records its own per-stage timings
+                # in modular_kernel.py (pf_dispatch/routed/pf_combine/shared).
+                result = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_input,
+                )
+            else: # 没走这里
+                with stage(self.layer_name, "experts"):
+                    result = self.quant_method.apply(
+                        layer=layer,
+                        x=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        shared_experts_input=shared_input,
+                    )
 
         if isinstance(result, tuple):
             assert shared_output is None
@@ -516,7 +534,8 @@ class DefaultMoERunner(MoERunner):
 
         if not run_shared_experts_before and self.has_separate_shared_experts:
             assert shared_output is None
-            shared_output = self._apply_shared_experts(shared_input, True)
+            with stage(self.layer_name, "shared"):
+                shared_output = self._apply_shared_experts(shared_input, True)
 
         return shared_output, hidden_states
 
@@ -763,6 +782,7 @@ class DefaultMoERunner(MoERunner):
                             shared_output_chunk, non_blocking=True
                         )
 
+        flush(hidden_states.shape[0])
         if self.shared_experts is None:
             return final_fused_hidden_states
         else:
@@ -806,11 +826,12 @@ class DefaultMoERunner(MoERunner):
         # TODO(bnell): parts of the dispatch/combine steps will go away once
         # #32567 lands and the remaining kernels are made MKs.  The PCP
         # code will probably remain
-        hidden_states, router_logits = self._maybe_dispatch(
-            layer,
-            hidden_states,
-            router_logits,
-        )
+        with stage(self.layer_name, "dispatch"):
+            hidden_states, router_logits = self._maybe_dispatch(
+                layer,
+                hidden_states,
+                router_logits,
+            )
 
         shared_output, hidden_states = self._apply_quant_method(
             layer=layer,
@@ -820,7 +841,11 @@ class DefaultMoERunner(MoERunner):
             run_shared_experts_before=run_shared_experts_before,
         )
 
-        return self._maybe_combine(
-            shared_output,
-            hidden_states,
-        )
+        with stage(self.layer_name, "combine"):
+            out = self._maybe_combine(
+                shared_output,
+                hidden_states,
+            )
+
+        flush(hidden_states.shape[0])
+        return out
